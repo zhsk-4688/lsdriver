@@ -46,6 +46,9 @@
 
 static volatile sig_atomic_t g_stop = 0;
 
+/* 前向声明（字段读取定义在定位代码之后） */
+static int32_t read_field(pid_t pid, uint64_t instance);
+
 static void on_signal(int sig)
 {
     (void)sig;
@@ -406,6 +409,15 @@ static uint64_t scan_instance(pid_t pid, const struct proc_map *maps, int nr,
                 if (p < 0x10000 || (p >> 48) != 0)
                     continue; /* 只扫用户态指针 */
 
+                /*
+                 * 实例引用必须指向堆（非模块映射内）。
+                 * 排除假阳性：模块 data 段里的 Il2CppClass* 类数组 / vtable /
+                 * 函数指针等，其 p 本身就在模块内，且 [p] 也指向模块内、
+                 * 页内还可能碰巧含类名字符串指针（Il2CppClass.name）。
+                 */
+                if (addr_in_module_ranges(p, ranges, nr_ranges))
+                    continue;
+
                 /* 对象头 klass：读 [p]，必须是模块内地址 */
                 uint64_t klass = 0;
                 if (ls_read(pid, p, &klass, 8) <= 0)
@@ -433,9 +445,11 @@ static uint64_t scan_instance(pid_t pid, const struct proc_map *maps, int nr,
                 if (!match)
                     continue;
 
+                /* 附加验证：IL2CPP 对象头 +8 为 monitor（通常 0），并读字段值展示 */
+                int32_t fv = read_field(pid, p);
                 printf("[candidate] 实例=0x%016" PRIx64 "  klass=0x%016" PRIx64
-                       "  引用槽位=0x%016" PRIx64 "\n",
-                       p, klass, a + (uint64_t)o);
+                       "  PunishDamage=%d  引用槽位=0x%016" PRIx64 "\n",
+                       p, klass, fv, a + (uint64_t)o);
                 candidates++;
                 if (!found)
                     found = p;
@@ -540,6 +554,8 @@ static uint64_t capture_write_pc(pid_t pid, uint64_t instance)
     if (!pc)
     {
         printf("[error] 超时未捕获写字段（游戏需进对局并触发过该字段写入）\n");
+        printf("[info] 当前字段值 = %d（若为 0 且实例可疑，请用 GameGuardian 核对实例地址）\n",
+               read_field(pid, instance));
         return 0;
     }
 
@@ -640,6 +656,10 @@ int main(void)
     printf("[定位] 实例 = 0x%016" PRIx64 "\n", instance);
 
     /* 4. 影子页无痕 hook */
+    /* 先打印当前字段值（即时反馈，验证实例是否有效） */
+    printf("\n[字段] PunishDamage @ 0x%016" PRIx64 " = %d\n",
+           instance + FIELD_OFFSET, read_field(pid, instance));
+
     run_nohook(pid, instance);
 
     printf("\ndemo 结束\n");
