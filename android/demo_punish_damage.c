@@ -18,6 +18,17 @@
  *   6. 轮询打印 PunishDamage 字段值变化；命中现场/寄存器见内核日志：
  *      dmesg | grep wxshadow
  *
+ * 三种运行模式（wxshadow 逻辑为主）：
+ *   ./demo_punish_damage -b <代码地址>
+ *       wxshadow 原版逻辑：直接在写字段指令处下无痕断点，零扫描、秒级生效。
+ *       命中时 dmesg 打印现场：x0=CSkillButtonManager 实例指针，
+ *       x1(或写指令源寄存器)=本次写入的伤害值。
+ *   ./demo_punish_damage --search
+ *       代码特征搜索：在代码段搜索 "str wX, [xY, #0x244]" 机器码模式，
+ *       打印候选指令地址（供 -b 使用）。
+ *   ./demo_punish_damage
+ *       自动模式：观察点捕获写字段 PC -> 无痕断点（需定位实例，稍慢）
+ *
  * Ctrl+C 退出并自动删除无痕断点。
  *
  * 编译：make -C android CROSS=aarch64-linux-gnu-
@@ -25,6 +36,7 @@
  * 运行：./demo_punish_damage     （root，lsdriver 已加载，游戏已进对局）
  */
 
+#include <getopt.h>
 #include <inttypes.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -562,7 +574,125 @@ static int32_t read_field(pid_t pid, uint64_t instance)
     return v;
 }
 
-/* ========== 影子页无痕 hook 主流程 ========== */
+/* ========== 代码特征搜索：写 0x244 字段的指令 ========== */
+
+/*
+ * 在可执行映射中搜索 ARM64 "str wX, [xY, #0x244]" 机器码：
+ *   STR (unsigned immediate, 32-bit): 0xB9000000 | (imm12<<10) | (Rn<<5) | Rt
+ *   imm12 = 0x244 >> 2 = 0x91
+ * 命中即为"写 PunishDamage 字段"的候选指令，可用 -b 下无痕断点。
+ */
+static void search_write_insn(pid_t pid)
+{
+    struct proc_map maps[MAX_MAPS];
+    int nr = parse_proc_maps(pid, maps, MAX_MAPS);
+    if (nr <= 0)
+    {
+        printf("[error] 解析 /proc/%d/maps 失败\n", pid);
+        return;
+    }
+
+    const uint32_t imm12 = (FIELD_OFFSET >> 2) & 0xFFF;
+    uint8_t buf[0x1000];
+    int total = 0;
+
+    printf("\n[search] 搜索 \"str wX, [xY, #0x%x]\" 指令（可执行映射）...\n", FIELD_OFFSET);
+
+    for (int i = 0; i < nr; i++)
+    {
+        if (!strchr(maps[i].perms, 'x'))
+            continue; /* 只扫可执行映射 */
+        if (!maps[i].path[0])
+            continue;
+
+        for (uint64_t a = maps[i].start; a + 4 <= maps[i].end; a += 0x1000)
+        {
+            int got = ls_read(pid, a, buf, sizeof(buf));
+            if (got <= 0)
+                continue;
+
+            for (int o = 0; o + 4 <= got; o += 4)
+            {
+                uint32_t insn;
+                memcpy(&insn, buf + o, 4);
+
+                if ((insn & 0xFFC00000) != 0xB9000000)
+                    continue; /* 不是 STR 32-bit unsigned immediate */
+                if (((insn >> 10) & 0xFFF) != imm12)
+                    continue; /* 偏移不是 0x244 */
+
+                unsigned rt = insn & 0x1F;
+                unsigned rn = (insn >> 5) & 0x1F;
+                uint64_t pc = a + (uint64_t)o;
+                printf("[search] 候选指令 @ 0x%016" PRIx64 "  str w%u, [x%u, #0x%x]  (%s)\n",
+                       pc, rt, rn, FIELD_OFFSET, maps[i].path);
+                printf("         -> 下断点: ./demo_punish_damage -b 0x%llx\n",
+                       (unsigned long long)pc);
+                total++;
+                if (total >= 20)
+                {
+                    printf("[search] 候选过多，停止（用 -b 指定最可能的那个）\n");
+                    return;
+                }
+            }
+        }
+    }
+
+    printf("[search] 共找到 %d 个候选指令\n", total);
+    if (total == 0)
+        printf("[search] 未找到写 0x%x 的 str 指令（字段可能通过其他指令写入，如 mov/ldp）\n",
+               FIELD_OFFSET);
+}
+
+/* ========== 影子页无痕 hook：wxshadow 直接断点模式 ========== */
+
+/*
+ * -b 模式：直接在写字段指令处下无痕断点（wxshadow 原版逻辑）。
+ * 零扫描、秒级生效；命中现场（x0=实例指针、写指令源寄存器=伤害值）
+ * 打印到内核日志：dmesg | grep wxshadow
+ */
+static void nohook_direct(pid_t pid, uint64_t pc)
+{
+    uint8_t insn_before[4] = {0}, insn_after[4] = {0};
+
+    printf("\n[nohook] 下断点前读取代码地址 0x%016" PRIx64 " ...\n", pc);
+    ls_read(pid, pc, insn_before, sizeof(insn_before));
+    printf("[nohook] 原始指令: %02x %02x %02x %02x\n",
+           insn_before[0], insn_before[1], insn_before[2], insn_before[3]);
+
+    printf("[nohook] 下 wxshadow 影子页无痕断点 @ 0x%016" PRIx64 " ...\n", pc);
+    if (ls_wxshadow_set_bp(pid, pc) < 0)
+    {
+        printf("[error] 无痕断点设置失败\n");
+        return;
+    }
+
+    ls_read(pid, pc, insn_after, sizeof(insn_after));
+
+    printf("\n[无痕验证] 断点地址指令字节（读取视角，前后应完全一致）:\n");
+    printf("  下断点前: %02x %02x %02x %02x\n",
+           insn_before[0], insn_before[1], insn_before[2], insn_before[3]);
+    printf("  下断点后: %02x %02x %02x %02x\n",
+           insn_after[0], insn_after[1], insn_after[2], insn_after[3]);
+    if (memcmp(insn_before, insn_after, sizeof(insn_before)) == 0)
+        printf("  => 一致！BRK 只存在于影子页，读取路径看不到断点，无痕生效\n");
+    else
+        printf("  => 不一致，请检查驱动日志\n");
+
+    printf("\n[hook] 断点已生效（wxshadow 逻辑）：\n");
+    printf("  命中时 dmesg 打印现场: dmesg | grep wxshadow\n");
+    printf("  x0 = CSkillButtonManager 实例指针\n");
+    printf("  写指令源寄存器 = 本次写入的 PunishDamage 值\n");
+    printf("  Ctrl+C 退出并删除断点\n");
+
+    while (!g_stop)
+        usleep(200 * 1000);
+
+    printf("\n[cleanup] 删除无痕断点\n");
+    ls_wxshadow_del_bp(pid, pc);
+}
+
+/* ========== 影子页无痕 hook：观察点自动捕获模式 ========== */
 
 /*
  * 第一步：硬件写观察点捕获"写字段的指令地址" PC。
@@ -661,10 +791,46 @@ static void run_nohook(pid_t pid, uint64_t instance)
     ls_wxshadow_del_bp(pid, pc);
 }
 
-/* ========== main（零参数） ========== */
+/* ========== main ========== */
 
-int main(void)
+static void usage(const char *prog)
 {
+    printf("usage: %s [options]\n", prog);
+    printf("  -b <addr>    wxshadow 直接断点：在写字段指令处下无痕断点（零扫描，推荐）\n");
+    printf("  --search     代码特征搜索：找 \"str wX,[xY,#0x%x]\" 写字段指令候选\n", FIELD_OFFSET);
+    printf("  （无参数）    自动模式：观察点捕获写字段 PC -> 无痕断点（需定位实例）\n");
+}
+
+int main(int argc, char *argv[])
+{
+    static const struct option long_opts[] = {
+        {"bp", required_argument, 0, 'b'},
+        {"search", no_argument, 0, 'S'},
+        {"help", no_argument, 0, 'h'},
+        {0, 0, 0, 0},
+    };
+
+    uint64_t bp_addr = 0;
+    bool do_search = false;
+
+    int opt;
+    while ((opt = getopt_long(argc, argv, "b:Sh", long_opts, NULL)) != -1)
+    {
+        switch (opt)
+        {
+        case 'b':
+            bp_addr = strtoull(optarg, NULL, 0);
+            break;
+        case 'S':
+            do_search = true;
+            break;
+        case 'h':
+        default:
+            usage(argv[0]);
+            return opt == 'h' ? 0 : 1;
+        }
+    }
+
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
 
@@ -689,6 +855,22 @@ int main(void)
         return 1;
     }
     printf("[target] pid = %d (%s)\n", pid, TARGET_PACKAGE);
+
+    /* 3. --search：只搜索写字段指令候选，不 hook */
+    if (do_search)
+    {
+        search_write_insn(pid);
+        return 0;
+    }
+
+    /* 4. -b：wxshadow 直接断点模式（零扫描，推荐） */
+    if (bp_addr)
+    {
+        nohook_direct(pid, bp_addr);
+        return 0;
+    }
+
+    /* 5. 自动模式：观察点捕获写字段 PC -> 无痕断点 */
 
     /* 3. IL2CPP 自动定位实例 */
     printf("\n[定位] CSkillButtonManager 实例（IL2CPP 元数据）...\n");
