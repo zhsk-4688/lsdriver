@@ -49,14 +49,19 @@ jobs:
         run: ddk pull "${{ matrix.ddk_target }}"
 
       - name: Build Module
-        working-directory: ${{ github.workspace }}/lsdriver
         run: |
-          rm -f ./*.ko
-          ddk clean --target "${{ matrix.ddk_target }}" || true
-          ddk build --target "${{ matrix.ddk_target }}" -- -j"$(nproc)"
-          test -f lsdriver.ko
-          mv -f lsdriver.ko "${{ matrix.output_ko }}"
-          ls -lh "${{ matrix.output_ko }}"
+          docker run --platform linux/amd64 --rm \
+            -v "${GITHUB_WORKSPACE}:/build" \
+            -w /build \
+            "ghcr.io/ylarod/ddk:${{ matrix.ddk_target }}" \
+            bash -lc '
+              source envsetup.sh
+              make -C "$KDIR" M=/build/lsdriver ARCH=arm64 LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- clean || true
+              make -C "$KDIR" M=/build/lsdriver ARCH=arm64 LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- modules -j"$(nproc)"
+            '
+          test -f "${GITHUB_WORKSPACE}/lsdriver/lsdriver.ko"
+          mv -f "${GITHUB_WORKSPACE}/lsdriver/lsdriver.ko" "${GITHUB_WORKSPACE}/lsdriver/${{ matrix.output_ko }}"
+          ls -lh "${GITHUB_WORKSPACE}/lsdriver/${{ matrix.output_ko }}"
 
       - name: Upload KO Artifact
         uses: actions/upload-artifact@v4
