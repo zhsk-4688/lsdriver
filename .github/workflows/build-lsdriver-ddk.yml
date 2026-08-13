@@ -55,7 +55,6 @@ jobs:
             -w /build \
             "ghcr.io/ylarod/ddk:${{ matrix.ddk_target }}" \
             bash -lc '
-              source envsetup.sh
               make -C "$KDIR" M=/build/lsdriver ARCH=arm64 LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- clean || true
               make -C "$KDIR" M=/build/lsdriver ARCH=arm64 LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- modules -j"$(nproc)"
             '

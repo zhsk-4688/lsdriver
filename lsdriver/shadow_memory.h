@@ -14,6 +14,8 @@
 #include "inline_hook_frame.h"
 #include "lsdriver_log.h"
 
+static inline int linear_read_physical(phys_addr_t paddr, void *buffer, size_t size);
+
 enum ls_shadow_state
 {
     LS_SHADOW_STATE_ORIGINAL = 0,
@@ -140,7 +142,7 @@ static void ls_shadow_unlink_page(struct ls_shadow_page *page)
 static bool ls_shadow_mapping_is_live(const struct ls_shadow_page *page, struct mm_struct *mm)
 {
     pte_t *ptep;
-    pte_t current;
+    pte_t current_pte;
     unsigned long pfn;
 
     if (!page || !mm) return false;
@@ -148,10 +150,10 @@ static bool ls_shadow_mapping_is_live(const struct ls_shadow_page *page, struct 
     ptep = get_user_pte(mm, page->page_addr);
     if (!ptep) return false;
 
-    current = READ_ONCE(*ptep);
-    if (!pte_present(current) || !pfn_valid(pte_pfn(current))) return false;
+    current_pte = READ_ONCE(*ptep);
+    if (!pte_present(current_pte) || !pfn_valid(pte_pfn(current_pte))) return false;
 
-    pfn = pte_pfn(current);
+    pfn = pte_pfn(current_pte);
     return pfn == page->orig_pfn || pfn == page->shadow_pfn;
 }
 

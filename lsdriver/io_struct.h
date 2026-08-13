@@ -1,5 +1,5 @@
 
-﻿#ifndef IO_STRUCT_H
+#ifndef IO_STRUCT_H
 #define IO_STRUCT_H
 #include <linux/vmalloc.h>
 #include <linux/mm.h>
