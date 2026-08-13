@@ -1,39 +1,31 @@
 /*
- * demo_punish_damage - 通过 lsdriver 驱动 hook 王者荣耀 CSkillButtonManager.PunishDamage 字段
+ * demo_punish_damage - 影子页（W^X Shadow Memory）无痕 hook demo
  *
  * 目标：
  *   com.tencent.tmgp.sgame（王者荣耀）
  *   CSkillButtonManager 类 private Int32 <PunishDamage>k__BackingField  // 偏移 0x244
- *   Dll : Scripts.GameCore.dll
- *   Namespace: Assets.Scripts.GameSystem
+ *   Dll : Scripts.GameCore.dll / Namespace: Assets.Scripts.GameSystem
  *
- * 功能（三种 hook 方式，全部零参数自动运行——自动定位类与实例）：
- *   1. 默认：连接驱动 -> 自动定位 CSkillButtonManager 实例（IL2CPP 元数据
- *      global-metadata.dat + 类名字符串 + 对象头 klass 验证）-> 读取 0x244
- *      字段值并打印
- *   2. -b <代码地址>：wxshadow 无痕隐藏断点（W^X 影子页）
- *      在写/读 PunishDamage 字段的指令地址下断点：进程读取该页永远看到
- *      原始指令（无痕），执行到断点地址触发 BRK；命中现场打印到内核日志
- *      （dmesg | grep wxshadow）；-r 可修改命中时的寄存器（hook 改字段值）；
- *      demo 同时轮询字段值变化打印
- *   3. --watch：arm64 硬件写观察点（WRP），监控字段被游戏写入，打印命中 PC
- *      与寄存器现场（可用来先找出"写字段的指令地址"，再配合 -b 转成无痕断点）
+ * 全自动、零参数（int main(void)）：
+ *   1. 连接 lsdriver 驱动，定位 com.tencent.tmgp.sgame 进程
+ *   2. IL2CPP 元数据自动定位 CSkillButtonManager 实例
+ *      （global-metadata.dat sanity 扫描 -> 字符串池匹配类名 ->
+ *       对象头 klass + 类名字符串指针双重验证）
+ *   3. 硬件写观察点捕获"写字段的指令地址" PC（一次命中即取到）
+ *   4. 移除观察点，在 PC 处下 wxshadow 无痕断点（影子页写 BRK）
+ *   5. 无痕验证：下断点前后读取 PC 处指令字节，应完全一致
+ *      （读取路径永远看到原始指令，BRK 只存在于影子页）
+ *   6. 轮询打印 PunishDamage 字段值变化；命中现场/寄存器见内核日志：
+ *      dmesg | grep wxshadow
  *
- * 编译：
- *   aarch64-linux-gnu-gcc -O2 -static -o demo_punish_damage demo_punish_damage.c
+ * Ctrl+C 退出并自动删除无痕断点。
  *
- * 运行（root，lsdriver 已加载，游戏已进对局）：
- *   ./demo_punish_damage                          # 自动定位实例并打印字段值
- *   ./demo_punish_damage -w 999                   # 修改字段
- *   ./demo_punish_damage --watch                  # 监控字段被写入（找写入 PC）
- *   ./demo_punish_damage -b 0x6f123456 -r x1=999  # 无痕断点 + 命中改寄存器
- *   ./demo_punish_damage -a 0x7b5c001000          # 手动指定实例地址（覆盖自动定位）
+ * 编译：make -C android CROSS=aarch64-linux-gnu-
+ * 运行：./demo_punish_damage     （root，lsdriver 已加载，游戏已进对局）
  */
 
 #define _GNU_SOURCE
 
-#include <ctype.h>
-#include <getopt.h>
 #include <inttypes.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -47,74 +39,22 @@
 
 /* ========== 目标定义 ========== */
 
-#define TARGET_PACKAGE   "com.tencent.tmgp.sgame"
-#define FIELD_NAME       "<PunishDamage>k__BackingField"
-#define FIELD_OFFSET     0x244 /* int32 */
-
-/* 候选代码模块关键字（IL2CPP 游戏代码所在模块） */
-static const char *const k_code_module_keywords[] = {
-    "GameCore",
-    "il2cpp",
-};
+#define TARGET_PACKAGE "com.tencent.tmgp.sgame"
+#define CLASS_NAME     "CSkillButtonManager"
+#define FIELD_OFFSET   0x244 /* <PunishDamage>k__BackingField, int32 */
 
 /* ========== 全局 ========== */
 
 static volatile sig_atomic_t g_stop = 0;
+
 static void on_signal(int sig)
 {
     (void)sig;
     g_stop = 1;
 }
 
-static bool str_contains_any(const char *s, const char *const *keys, int n)
-{
-    for (int i = 0; i < n; i++)
-    {
-        if (s && keys[i] && strcasestr(s, keys[i]))
-            return true;
-    }
-    return false;
-}
+/* ========== IL2CPP 自动定位（零参数） ========== */
 
-/* ========== 模块与代码段收集 ========== */
-
-struct code_seg
-{
-    uint64_t start;
-    uint64_t end;
-};
-
-#define MAX_CODE_SEGS 64
-
-static int collect_code_segments(struct ls_virtual_memory *mem, struct code_seg *segs, int max_segs)
-{
-    int n = 0;
-
-    for (int i = 0; i < mem->module_count && n < max_segs; i++)
-    {
-        const struct ls_module_info *mod = &mem->modules[i];
-
-        if (!str_contains_any(mod->name, k_code_module_keywords, 2))
-            continue;
-
-        printf("[module] %-48s base=0x%016" PRIx64 "\n", mod->name,
-               mod->seg_count ? mod->segs[0].start : 0);
-
-        for (int s = 0; s < mod->seg_count && n < max_segs; s++)
-        {
-            const struct ls_segment_info *seg = &mod->segs[s];
-            if ((seg->prot & 4) && seg->start < seg->end) /* 可执行段 */
-            {
-                segs[n].start = seg->start;
-                segs[n].end = seg->end;
-                n++;
-            }
-        }
-    }
-    return n;
-}
-
-/* ========== IL2CPP 自动定位（无需任何参数） ========== */
 /*
  * 定位流程：
  *   1. 扫描进程可读映射找 global-metadata.dat 特征（sanity 0xFAB11BAF）
@@ -128,9 +68,6 @@ static int collect_code_segments(struct ls_virtual_memory *mem, struct code_seg 
 #define MD_SANITY 0xFAB11BAF
 #define MD_STRING_OFFSET_FIELD 0x18 /* Il2CppGlobalMetadataHeader.stringOffset */
 #define MD_STRING_COUNT_FIELD 0x1C  /* Il2CppGlobalMetadataHeader.stringCount */
-#define CLASS_NAME "CSkillButtonManager"
-#define CLASS_NS "Assets.Scripts.GameSystem"
-
 #define MAX_MAPS 4096
 #define MAX_SCAN_CHUNKS (256UL * 1024 * 1024 / 0x1000) /* 字符串池扫描上限 256MB */
 
@@ -215,8 +152,8 @@ static uint64_t locate_metadata(pid_t pid, const struct proc_map *maps, int nr, 
     return 0;
 }
 
-/* 2+3. 字符串池内模式匹配类名，返回类名字符串地址（可能多个，全部打印，取第一个） */
-static uint64_t locate_class_string(pid_t pid, uint64_t metadata_base, uint64_t *out_ns_addr)
+/* 2+3. 字符串池内模式匹配类名，返回类名字符串地址（可能多个，取第一个） */
+static uint64_t locate_class_string(pid_t pid, uint64_t metadata_base)
 {
     uint32_t str_off = 0, str_count = 0;
 
@@ -230,7 +167,7 @@ static uint64_t locate_class_string(pid_t pid, uint64_t metadata_base, uint64_t 
     printf("[metadata] 字符串池: base=0x%016" PRIx64 " count=%u\n", pool, str_count);
 
     static const char pattern[] = CLASS_NAME; /* 含结尾 \0 */
-    size_t pat_len = sizeof(pattern) - 1;     /* "CSkillButtonManager" 长度 */
+    size_t pat_len = sizeof(pattern) - 1;
 
     uint8_t buf[0x1000];
     uint8_t tail[32];
@@ -238,7 +175,6 @@ static uint64_t locate_class_string(pid_t pid, uint64_t metadata_base, uint64_t 
     uint64_t first = 0;
     int found = 0;
 
-    /* 池大小未知，从 pool 起扫描（上限 256MB） */
     for (uint64_t a = pool; a < pool + MAX_SCAN_CHUNKS * 0x1000; a += 0x1000)
     {
         int got = ls_read(pid, a, buf, sizeof(buf));
@@ -270,7 +206,6 @@ static uint64_t locate_class_string(pid_t pid, uint64_t metadata_base, uint64_t 
             }
         }
 
-        /* 保存尾部用于跨块匹配 */
         tail_len = pat_len - 1 < (size_t)got ? pat_len - 1 : (size_t)got;
         memcpy(tail, buf + got - tail_len, tail_len);
 
@@ -309,7 +244,6 @@ static int collect_module_ranges(const struct proc_map *maps, int nr,
         n++;
     }
 
-    /* 按 start 排序 */
     for (int i = 1; i < n; i++)
     {
         struct mod_range r = ranges[i];
@@ -343,7 +277,7 @@ static bool addr_in_module_ranges(uint64_t addr, const struct mod_range *ranges,
 /* 4. 扫描实例：p 指向对象，对象头 klass 在模块内，且 klass 附近有类名字符串指针 */
 static uint64_t scan_instance(pid_t pid, const struct proc_map *maps, int nr,
                               const struct mod_range *ranges, int nr_ranges,
-                              uint64_t class_str_addr, uint64_t *out_klass)
+                              uint64_t class_str_addr)
 {
     uint8_t chunk[0x1000];
     uint64_t found = 0;
@@ -406,17 +340,12 @@ static uint64_t scan_instance(pid_t pid, const struct proc_map *maps, int nr,
                 if (!match)
                     continue;
 
-                uint64_t obj = p;
                 printf("[candidate] 实例=0x%016" PRIx64 "  klass=0x%016" PRIx64
                        "  引用槽位=0x%016" PRIx64 "\n",
-                       obj, klass, a + (uint64_t)o);
+                       p, klass, a + (uint64_t)o);
                 candidates++;
                 if (!found)
-                {
-                    found = obj;
-                    if (out_klass)
-                        *out_klass = klass;
-                }
+                    found = p;
                 if (candidates >= 10)
                 {
                     printf("[scan] 候选过多，停止扫描\n");
@@ -433,10 +362,7 @@ static uint64_t scan_instance(pid_t pid, const struct proc_map *maps, int nr,
     return found;
 }
 
-/*
- * 自动定位 CSkillButtonManager 实例（零参数）。
- * 返回实例地址；失败返回 0。
- */
+/* 自动定位 CSkillButtonManager 实例（零参数）。返回实例地址；失败返回 0。 */
 static uint64_t auto_locate_instance(pid_t pid)
 {
     struct proc_map maps[MAX_MAPS];
@@ -447,25 +373,21 @@ static uint64_t auto_locate_instance(pid_t pid)
         return 0;
     }
 
-    /* 1. metadata */
     int md_version = 0;
     uint64_t md = locate_metadata(pid, maps, nr, &md_version);
     if (!md)
     {
-        printf("[error] 未找到 global-metadata.dat（sanity 0x%x），请用 -a 指定实例地址\n",
-               MD_SANITY);
+        printf("[error] 未找到 global-metadata.dat（sanity 0x%x）\n", MD_SANITY);
         return 0;
     }
 
-    /* 2. 类名字符串 */
-    uint64_t class_str = locate_class_string(pid, md, NULL);
+    uint64_t class_str = locate_class_string(pid, md);
     if (!class_str)
     {
         printf("[error] 字符串池中未找到类名 \"%s\"\n", CLASS_NAME);
         return 0;
     }
 
-    /* 3. 模块范围 + 实例扫描 */
     struct mod_range ranges[MAX_MOD_RANGES];
     int nr_ranges = collect_module_ranges(maps, nr, ranges, MAX_MOD_RANGES);
     if (nr_ranges <= 0)
@@ -474,125 +396,98 @@ static uint64_t auto_locate_instance(pid_t pid)
         return 0;
     }
 
-    return scan_instance(pid, maps, nr, ranges, nr_ranges, class_str, NULL);
+    return scan_instance(pid, maps, nr, ranges, nr_ranges, class_str);
 }
 
-/* ========== 字段读写 ========== */
+/* ========== 字段读取 ========== */
 
 static int32_t read_field(pid_t pid, uint64_t instance)
 {
     int32_t v = 0;
     if (ls_read(pid, instance + FIELD_OFFSET, &v, sizeof(v)) <= 0)
-    {
-        printf("[error] 读取字段失败\n");
         return 0;
-    }
     return v;
 }
 
-static void print_field(pid_t pid, uint64_t instance)
+/* ========== 影子页无痕 hook 主流程 ========== */
+
+/*
+ * 第一步：硬件写观察点捕获"写字段的指令地址" PC。
+ * 命中记录由驱动直接写入共享内存（req->bp_info），轮询即可。
+ * 返回写指令 PC；超时返回 0。
+ */
+static uint64_t capture_write_pc(pid_t pid, uint64_t instance)
 {
-    int32_t v = read_field(pid, instance);
-    printf("\n===== %s.%s =====\n", "CSkillButtonManager", FIELD_NAME);
-    printf("instance        = 0x%016" PRIx64 "\n", instance);
-    printf("field offset    = 0x%x\n", FIELD_OFFSET);
-    printf("field address   = 0x%016" PRIx64 "\n", instance + FIELD_OFFSET);
-    printf("PunishDamage    = %d (0x%x)\n", v, (unsigned)v);
-    printf("===========================\n");
-}
+    struct ls_break_point bp;
+    uint64_t watch_addr = instance + FIELD_OFFSET;
+    uint64_t pc = 0;
 
-/* ========== wxshadow 无痕断点 ========== */
+    printf("\n[step 1/4] 硬件写观察点 @ 0x%016" PRIx64 "（捕获写字段指令，最多等 60 秒）...\n",
+           watch_addr);
 
-#define MAX_REG_MODS 4
-
-struct reg_mod
-{
-    int reg_idx; /* 0-30 = x0-x30, 31 = sp */
-    uint64_t value;
-};
-
-/* 解析 "x1=999" 或 "sp=0x100" */
-static int parse_reg_mod(const char *str, struct reg_mod *mod)
-{
-    const char *eq = strchr(str, '=');
-    if (!eq || eq == str)
-        return -1;
-
-    char name[16];
-    size_t len = (size_t)(eq - str);
-    if (len >= sizeof(name))
-        return -1;
-    memcpy(name, str, len);
-    name[len] = '\0';
-
-    if (strcasecmp(name, "sp") == 0)
-        mod->reg_idx = 31;
-    else if (tolower(name[0]) == 'x' && name[1] >= '0' && name[1] <= '9')
+    if (ls_hwbp_set(pid, watch_addr, BP_BREAKPOINT_W, BP_BREAKPOINT_LEN_4, &bp) < 0)
     {
-        int idx = atoi(name + 1);
-        if (idx < 0 || idx > 30)
-            return -1;
-        mod->reg_idx = idx;
+        printf("[error] 设置观察点失败\n");
+        return 0;
     }
-    else
-        return -1;
 
-    mod->value = strtoull(eq + 1, NULL, 0);
-    return 0;
+    for (int i = 0; i < 300 && !g_stop; i++)
+    {
+        struct ls_bp_point *pt = &g_req->bp_info.points[0];
+        if (pt->record_count > 0 && pt->records[0].hit_count > 0)
+        {
+            pc = pt->records[0].pc;
+            break;
+        }
+        usleep(200 * 1000);
+    }
+
+    ls_hwbp_remove();
+    if (!pc)
+    {
+        printf("[error] 超时未捕获写字段（游戏需进对局并触发过该字段写入）\n");
+        return 0;
+    }
+
+    printf("[step 1/4] 写字段指令 PC = 0x%016" PRIx64 "\n", pc);
+    return pc;
 }
 
 /*
- * 无痕断点模式：
- *   1. 下断点前读代码地址指令字节
- *   2. PR_WXSHADOW_SET_BP 在代码地址下隐藏断点（影子页写 BRK）
- *   3. 可选 PR_WXSHADOW_SET_REG 配置命中时寄存器修改
- *   4. 下断点后再读同一地址指令字节 —— 与下断点前完全一致，
- *      证明读取路径永远看到原始指令（无痕）
- *   5. 轮询字段值变化并打印（命中现场/寄存器见 dmesg | grep wxshadow）
+ * 主流程：在写字段指令处下影子页无痕断点，无痕验证 + 轮询打印字段值。
  */
-static void nohook_field(pid_t pid, uint64_t instance, uint64_t code_addr,
-                         const struct reg_mod *mods, int nr_mods)
+static void run_nohook(pid_t pid, uint64_t instance)
 {
+    uint64_t pc = capture_write_pc(pid, instance);
+    if (!pc)
+        return;
+
+    /* 无痕验证：下断点前后读取同一代码地址的指令字节 */
     uint8_t insn_before[4] = {0}, insn_after[4] = {0};
+    ls_read(pid, pc, insn_before, sizeof(insn_before));
 
-    printf("\n[nohook] 下断点前读取代码地址 0x%016" PRIx64 " ...\n", code_addr);
-    if (ls_read(pid, code_addr, insn_before, sizeof(insn_before)) <= 0)
-        printf("[warn] 读取断点地址失败\n");
-
-    printf("[nohook] 设置 wxshadow 无痕隐藏断点 @ 0x%016" PRIx64 " ...\n", code_addr);
-    int ret = ls_wxshadow_set_bp(pid, code_addr);
-    if (ret < 0)
+    printf("\n[step 2/4] 下 wxshadow 影子页无痕断点 @ 0x%016" PRIx64 " ...\n", pc);
+    if (ls_wxshadow_set_bp(pid, pc) < 0)
     {
-        printf("[error] 设置无痕断点失败: %d\n", ret);
+        printf("[error] 无痕断点设置失败\n");
         return;
     }
-    printf("[nohook] 断点已设置（执行时触发，读取时无痕）\n");
 
-    for (int i = 0; i < nr_mods; i++)
-    {
-        ret = ls_wxshadow_set_reg(pid, code_addr, mods[i].reg_idx, mods[i].value);
-        if (ret < 0)
-            printf("[error] 设置寄存器修改 x%d 失败: %d\n", mods[i].reg_idx, ret);
-        else
-            printf("[nohook] 命中时修改 x%-2d = 0x%llx\n",
-                   mods[i].reg_idx, (unsigned long long)mods[i].value);
-    }
+    ls_read(pid, pc, insn_after, sizeof(insn_after));
 
-    /* 无痕性演示：断点已设置，但读到的仍应是原始指令 */
-    if (ls_read(pid, code_addr, insn_after, sizeof(insn_after)) <= 0)
-        printf("[warn] 再次读取断点地址失败\n");
-
-    printf("\n[无痕演示] 断点地址指令字节（读取视角，下断点前后应完全一致）:\n");
+    printf("\n[无痕验证] 断点地址指令字节（读取视角，前后应完全一致）:\n");
     printf("  下断点前: %02x %02x %02x %02x\n",
            insn_before[0], insn_before[1], insn_before[2], insn_before[3]);
     printf("  下断点后: %02x %02x %02x %02x\n",
            insn_after[0], insn_after[1], insn_after[2], insn_after[3]);
     if (memcmp(insn_before, insn_after, sizeof(insn_before)) == 0)
-        printf("  => 一致！读取路径看不到断点（BRK 只存在于影子页），无痕生效\n");
+        printf("  => 一致！BRK 只存在于影子页，读取路径看不到断点，无痕生效\n");
     else
         printf("  => 不一致，请检查驱动日志\n");
 
-    printf("\n[nohook] 轮询字段值变化（Ctrl+C 退出；命中现场见 dmesg | grep wxshadow）\n");
+    printf("\n[step 3/4] 断点已生效。命中现场见内核日志: dmesg | grep wxshadow\n");
+    printf("[step 4/4] 轮询 PunishDamage 字段值变化（Ctrl+C 退出并删除断点）\n");
+
     int32_t last = read_field(pid, instance);
     printf("  PunishDamage = %d\n", last);
 
@@ -607,149 +502,19 @@ static void nohook_field(pid_t pid, uint64_t instance, uint64_t code_addr,
         usleep(100 * 1000);
     }
 
-    printf("\n[nohook] 清理：删除断点\n");
-    ls_wxshadow_del_bp(pid, code_addr);
+    printf("\n[cleanup] 删除无痕断点\n");
+    ls_wxshadow_del_bp(pid, pc);
 }
 
-/* ========== 硬件写观察点监控 ========== */
+/* ========== main（零参数） ========== */
 
-static void watch_field(pid_t pid, uint64_t instance)
+int main(void)
 {
-    struct ls_break_point bp;
-    uint64_t watch_addr = instance + FIELD_OFFSET;
-
-    printf("\n[watch] 对 0x%016" PRIx64 " 设置硬件写观察点（Ctrl+C 退出）...\n", watch_addr);
-
-    int ret = ls_hwbp_set(pid, watch_addr, BP_BREAKPOINT_W, BP_BREAKPOINT_LEN_4, &bp);
-    if (ret < 0)
-    {
-        printf("[error] 设置观察点失败: %d（驱动是否已编译 arm64_hwdbg？）\n", ret);
-        return;
-    }
-
-    uint64_t last_hits[BP_RECORD_MAX] = {0};
-    int printed = 0;
-
-    while (!g_stop)
-    {
-        /* 驱动把命中记录直接写入共享内存的 req->bp_info，直接读取 */
-        struct ls_bp_point *pt = &g_req->bp_info.points[0];
-
-        for (int i = 0; i < pt->record_count && i < BP_RECORD_MAX; i++)
-        {
-            const struct ls_bp_record *rec = &pt->records[i];
-            if (rec->hit_count > last_hits[i])
-            {
-                uint64_t delta = rec->hit_count - last_hits[i];
-                printf("\n[hit #%llu] PC=0x%016llx  LR=0x%016llx\n",
-                       (unsigned long long)rec->hit_count,
-                       (unsigned long long)rec->pc,
-                       (unsigned long long)rec->lr);
-                printf("  x0=%016llx x1=%016llx x2=%016llx x3=%016llx\n",
-                       (unsigned long long)rec->x0, (unsigned long long)rec->x1,
-                       (unsigned long long)rec->x2, (unsigned long long)rec->x3);
-                printf("  x4=%016llx x5=%016llx x6=%016llx x7=%016llx\n",
-                       (unsigned long long)rec->x4, (unsigned long long)rec->x5,
-                       (unsigned long long)rec->x6, (unsigned long long)rec->x7);
-                printf("  [%u 次] PunishDamage = %d\n", (unsigned)delta,
-                       read_field(pid, instance));
-                last_hits[i] = rec->hit_count;
-                printed++;
-            }
-        }
-        usleep(100 * 1000);
-    }
-
-    ls_hwbp_remove();
-    printf("\n[watch] 退出，共打印 %d 次命中\n", printed);
-}
-
-/* ========== main ========== */
-
-static void usage(const char *prog)
-{
-    printf("usage: %s [options]\n", prog);
-    printf("  -p <pid|包名>   目标进程（默认 %s）\n", TARGET_PACKAGE);
-    printf("  -a <addr>       直接指定 CSkillButtonManager 实例地址（跳过扫描）\n");
-    printf("  -w <value>      修改 PunishDamage 字段值后重新读取打印\n");
-    printf("  -b <addr>       wxshadow 无痕隐藏断点：在读写字段的代码地址下断点\n");
-    printf("                  （先用 --watch 观察命中 PC，或在反编译工具里找写 0x244 的指令）\n");
-    printf("  -r xN=<value>   无痕断点命中时修改寄存器（如 -r x1=999，可多次）\n");
-    printf("  --watch         硬件写观察点，监控字段被写入并打印命中 PC/寄存器\n");
-    printf("  -m              只打印模块列表\n");
-    printf("  -h              帮助\n");
-}
-
-int main(int argc, char *argv[])
-{
-    static const struct option long_opts[] = {
-        {"pid", required_argument, 0, 'p'},
-        {"addr", required_argument, 0, 'a'},
-        {"write", required_argument, 0, 'w'},
-        {"bp", required_argument, 0, 'b'},
-        {"reg", required_argument, 0, 'r'},
-        {"watch", no_argument, 0, 'W'},
-        {"modules", no_argument, 0, 'm'},
-        {"help", no_argument, 0, 'h'},
-        {0, 0, 0, 0},
-    };
-
-    const char *target = TARGET_PACKAGE;
-    uint64_t instance = 0;
-    uint64_t bp_addr = 0;
-    int32_t write_val = 0;
-    bool do_write = false;
-    bool do_watch = false;
-    bool only_modules = false;
-    struct reg_mod reg_mods[MAX_REG_MODS];
-    int nr_reg_mods = 0;
-
-    int opt;
-    while ((opt = getopt_long(argc, argv, "p:a:w:b:r:Wmh", long_opts, NULL)) != -1)
-    {
-        switch (opt)
-        {
-        case 'p':
-            target = optarg;
-            break;
-        case 'a':
-            instance = strtoull(optarg, NULL, 0);
-            break;
-        case 'w':
-            write_val = (int32_t)strtol(optarg, NULL, 0);
-            do_write = true;
-            break;
-        case 'b':
-            bp_addr = strtoull(optarg, NULL, 0);
-            break;
-        case 'r':
-            if (nr_reg_mods >= MAX_REG_MODS)
-            {
-                fprintf(stderr, "寄存器修改最多 %d 个\n", MAX_REG_MODS);
-                return 1;
-            }
-            if (parse_reg_mod(optarg, &reg_mods[nr_reg_mods]) < 0)
-            {
-                fprintf(stderr, "非法寄存器修改: %s（格式 xN=value 或 sp=value）\n", optarg);
-                return 1;
-            }
-            nr_reg_mods++;
-            break;
-        case 'W':
-            do_watch = true;
-            break;
-        case 'm':
-            only_modules = true;
-            break;
-        case 'h':
-        default:
-            usage(argv[0]);
-            return opt == 'h' ? 0 : 1;
-        }
-    }
-
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
+
+    printf("===== 影子页无痕 hook demo：CSkillButtonManager.PunishDamage (0x%x) =====\n",
+           FIELD_OFFSET);
 
     /* 1. 连接驱动 */
     printf("[lsdriver] 连接驱动...\n");
@@ -761,78 +526,28 @@ int main(int argc, char *argv[])
     }
     printf("[lsdriver] 已连接\n");
 
-    /* 2. 定位目标进程 */
-    pid_t pid = -1;
-    if (target[0] >= '0' && target[0] <= '9')
-        pid = (pid_t)atoi(target);
-    else
-        pid = ls_find_pid_by_name(target);
+    /* 2. 定位进程 */
+    pid_t pid = ls_find_pid_by_name(TARGET_PACKAGE);
     if (pid <= 0)
     {
-        printf("[error] 找不到进程: %s（游戏是否在运行？）\n", target);
+        printf("[error] 找不到进程 %s（游戏是否在运行？）\n", TARGET_PACKAGE);
         return 1;
     }
-    printf("[target] pid = %d (%s)\n", pid, target);
+    printf("[target] pid = %d (%s)\n", pid, TARGET_PACKAGE);
 
-    /* 3. 枚举内存布局 */
-    struct ls_virtual_memory *mem = malloc(sizeof(*mem));
-    if (!mem)
-        return 1;
-    ret = ls_get_memory_info(pid, mem);
-    if (ret < 0)
-    {
-        printf("[error] 枚举内存失败: %d\n", ret);
-        free(mem);
-        return 1;
-    }
-    printf("[target] modules=%d regions=%d\n", mem->module_count, mem->region_count);
-
-    struct code_seg segs[MAX_CODE_SEGS];
-    int nr_segs = collect_code_segments(mem, segs, MAX_CODE_SEGS);
-
-    if (only_modules)
-    {
-        free(mem);
-        return 0;
-    }
-
-    /* 4. 定位实例：-a 指定，否则 IL2CPP 元数据自动定位（零参数） */
+    /* 3. IL2CPP 自动定位实例 */
+    printf("\n[定位] CSkillButtonManager 实例（IL2CPP 元数据）...\n");
+    uint64_t instance = auto_locate_instance(pid);
     if (!instance)
     {
-        instance = auto_locate_instance(pid);
-        if (!instance)
-        {
-            printf("[error] 自动定位失败，请用 -a <addr> 直接指定实例地址\n");
-            free(mem);
-            return 1;
-        }
-        printf("[scan] 采用实例: 0x%016" PRIx64 "\n", instance);
+        printf("[error] 自动定位失败（游戏需已进对局）\n");
+        return 1;
     }
+    printf("[定位] 实例 = 0x%016" PRIx64 "\n", instance);
 
-    /* 5. 修改字段（可选） */
-    if (do_write)
-    {
-        if (ls_write(pid, instance + FIELD_OFFSET, &write_val, sizeof(write_val)) <= 0)
-            printf("[error] 写入字段失败\n");
-        else
-            printf("[write] 已写入 PunishDamage = %d\n", write_val);
-    }
+    /* 4. 影子页无痕 hook */
+    run_nohook(pid, instance);
 
-    /* 6. wxshadow 无痕断点模式（可选） */
-    if (bp_addr)
-    {
-        nohook_field(pid, instance, bp_addr, reg_mods, nr_reg_mods);
-        free(mem);
-        return 0;
-    }
-
-    /* 7. 打印字段值 */
-    print_field(pid, instance);
-
-    /* 8. 观察点监控（可选） */
-    if (do_watch)
-        watch_field(pid, instance);
-
-    free(mem);
+    printf("\ndemo 结束\n");
     return 0;
 }
