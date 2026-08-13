@@ -7,8 +7,10 @@
  *   Dll : Scripts.GameCore.dll
  *   Namespace: Assets.Scripts.GameSystem
  *
- * 功能（三种 hook 方式）：
- *   1. 默认：连接驱动，定位实例后读取 0x244 字段值并打印（普通内存读取）
+ * 功能（三种 hook 方式，全部零参数自动运行——自动定位类与实例）：
+ *   1. 默认：连接驱动 -> 自动定位 CSkillButtonManager 实例（IL2CPP 元数据
+ *      global-metadata.dat + 类名字符串 + 对象头 klass 验证）-> 读取 0x244
+ *      字段值并打印
  *   2. -b <代码地址>：wxshadow 无痕隐藏断点（W^X 影子页）
  *      在写/读 PunishDamage 字段的指令地址下断点：进程读取该页永远看到
  *      原始指令（无痕），执行到断点地址触发 BRK；命中现场打印到内核日志
@@ -20,13 +22,12 @@
  * 编译：
  *   aarch64-linux-gnu-gcc -O2 -static -o demo_punish_damage demo_punish_damage.c
  *
- * 运行（root，lsdriver 已加载）：
- *   ./demo_punish_damage                          # 自动扫描实例并打印字段值
- *   ./demo_punish_damage -a 0x7b5c001000          # 直接指定实例地址
- *   ./demo_punish_damage -a 0x7b5c001000 -w 999   # 修改字段
- *   ./demo_punish_damage -a 0x7b5c001000 --watch  # 监控字段被写入（找写入 PC）
- *   ./demo_punish_damage -a 0x7b5c001000 \
- *       -b 0x6f123456 -r x1=999                   # 无痕断点 + 命中改寄存器
+ * 运行（root，lsdriver 已加载，游戏已进对局）：
+ *   ./demo_punish_damage                          # 自动定位实例并打印字段值
+ *   ./demo_punish_damage -w 999                   # 修改字段
+ *   ./demo_punish_damage --watch                  # 监控字段被写入（找写入 PC）
+ *   ./demo_punish_damage -b 0x6f123456 -r x1=999  # 无痕断点 + 命中改寄存器
+ *   ./demo_punish_damage -a 0x7b5c001000          # 手动指定实例地址（覆盖自动定位）
  */
 
 #define _GNU_SOURCE
@@ -55,10 +56,6 @@ static const char *const k_code_module_keywords[] = {
     "GameCore",
     "il2cpp",
 };
-
-/* 扫描候选的伤害值合理范围 */
-#define PUNISH_VALUE_MIN 0
-#define PUNISH_VALUE_MAX 100000
 
 /* ========== 全局 ========== */
 
@@ -117,77 +114,313 @@ static int collect_code_segments(struct ls_virtual_memory *mem, struct code_seg 
     return n;
 }
 
-static bool addr_in_code_segs(uint64_t addr, const struct code_seg *segs, int n)
+/* ========== IL2CPP 自动定位（无需任何参数） ========== */
+/*
+ * 定位流程：
+ *   1. 扫描进程可读映射找 global-metadata.dat 特征（sanity 0xFAB11BAF）
+ *   2. 读 metadata 头的 stringOffset/stringCount（偏移 0x18/0x1C，IL2CPP 24~32 稳定）
+ *   3. 在字符串池内存中模式匹配类名 "CSkillButtonManager" -> 类名字符串精确地址
+ *   4. 扫描进程可写映射：指针 p 指向的对象，其对象头 klass 落在模块映射内，
+ *      且 klass 结构附近（±0x200）存在指向类名字符串的指针（Il2CppClass.name）
+ *      -> p 就是 CSkillButtonManager 实例
+ */
+
+#define MD_SANITY 0xFAB11BAF
+#define MD_STRING_OFFSET_FIELD 0x18 /* Il2CppGlobalMetadataHeader.stringOffset */
+#define MD_STRING_COUNT_FIELD 0x1C  /* Il2CppGlobalMetadataHeader.stringCount */
+#define CLASS_NAME "CSkillButtonManager"
+#define CLASS_NS "Assets.Scripts.GameSystem"
+
+#define MAX_MAPS 4096
+#define MAX_SCAN_CHUNKS (256UL * 1024 * 1024 / 0x1000) /* 字符串池扫描上限 256MB */
+
+struct proc_map
 {
-    for (int i = 0; i < n; i++)
+    uint64_t start;
+    uint64_t end;
+    char perms[8];
+    char path[256];
+    bool readable;
+    bool writable;
+};
+
+static int parse_proc_maps(pid_t pid, struct proc_map *maps, int max)
+{
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/maps", pid);
+    FILE *fp = fopen(path, "r");
+    if (!fp)
+        return -1;
+
+    char line[512];
+    int n = 0;
+    while (fgets(line, sizeof(line), fp) && n < max)
     {
-        if (addr >= segs[i].start && addr < segs[i].end)
+        unsigned long start = 0, end = 0;
+        char perms[8] = {0};
+        char p[256] = {0};
+
+        if (sscanf(line, "%lx-%lx %7s %*lx %*x:%*x %*lu %255[^\n]",
+                   &start, &end, perms, p) < 3)
+            continue;
+        if (end <= start)
+            continue;
+
+        maps[n].start = start;
+        maps[n].end = end;
+        snprintf(maps[n].perms, sizeof(maps[n].perms), "%s", perms);
+        maps[n].readable = strchr(perms, 'r') != NULL;
+        maps[n].writable = strchr(perms, 'w') != NULL;
+        snprintf(maps[n].path, sizeof(maps[n].path), "%s", p);
+        n++;
+    }
+    fclose(fp);
+    return n;
+}
+
+/* 1. 扫描 metadata sanity */
+static uint64_t locate_metadata(pid_t pid, const struct proc_map *maps, int nr, int *version)
+{
+    uint8_t buf[0x1000];
+
+    for (int i = 0; i < nr; i++)
+    {
+        if (!maps[i].readable || maps[i].end - maps[i].start < 8)
+            continue;
+
+        int got = ls_read(pid, maps[i].start, buf, sizeof(buf));
+        if (got <= 0)
+            continue;
+
+        for (int off = 0; off + 8 <= got; off += 4)
+        {
+            uint32_t sanity;
+            memcpy(&sanity, buf + off, 4);
+            if (sanity != MD_SANITY)
+                continue;
+
+            int32_t ver;
+            memcpy(&ver, buf + off + 4, 4);
+            if (ver < 24 || ver > 32)
+                continue; /* IL2CPP 版本范围（24~32） */
+
+            if (version)
+                *version = ver;
+            printf("[metadata] 找到 global-metadata.dat: base=0x%016" PRIx64
+                   " version=%d\n",
+                   maps[i].start + (uint64_t)off, ver);
+            return maps[i].start + (uint64_t)off;
+        }
+    }
+    return 0;
+}
+
+/* 2+3. 字符串池内模式匹配类名，返回类名字符串地址（可能多个，全部打印，取第一个） */
+static uint64_t locate_class_string(pid_t pid, uint64_t metadata_base, uint64_t *out_ns_addr)
+{
+    uint32_t str_off = 0, str_count = 0;
+
+    if (ls_read(pid, metadata_base + MD_STRING_OFFSET_FIELD, &str_off, 4) <= 0 ||
+        ls_read(pid, metadata_base + MD_STRING_COUNT_FIELD, &str_count, 4) <= 0)
+        return 0;
+    if (str_off == 0 || str_count == 0 || str_count > 0x2000000)
+        return 0;
+
+    uint64_t pool = metadata_base + str_off;
+    printf("[metadata] 字符串池: base=0x%016" PRIx64 " count=%u\n", pool, str_count);
+
+    static const char pattern[] = CLASS_NAME; /* 含结尾 \0 */
+    size_t pat_len = sizeof(pattern) - 1;     /* "CSkillButtonManager" 长度 */
+
+    uint8_t buf[0x1000];
+    uint8_t tail[32];
+    size_t tail_len = 0;
+    uint64_t first = 0;
+    int found = 0;
+
+    /* 池大小未知，从 pool 起扫描（上限 256MB） */
+    for (uint64_t a = pool; a < pool + MAX_SCAN_CHUNKS * 0x1000; a += 0x1000)
+    {
+        int got = ls_read(pid, a, buf, sizeof(buf));
+        if (got <= 0)
+            continue;
+
+        /* 拼接上一块尾部，覆盖跨块模式；逻辑数据从 logical_base 开始 */
+        uint8_t combined[0x1000 + 32];
+        size_t logical_len = (size_t)got + tail_len;
+        uint64_t logical_base = a - tail_len;
+
+        memcpy(combined, tail, tail_len);
+        memcpy(combined + tail_len, buf, (size_t)got);
+
+        for (size_t i = 0; i + pat_len <= logical_len; i++)
+        {
+            if (memcmp(combined + i, pattern, pat_len) != 0)
+                continue;
+
+            uint64_t saddr = logical_base + (uint64_t)i;
+            printf("[metadata] 类名 \"%s\" @ 0x%016" PRIx64 " (nameIndex=0x%x)\n",
+                   CLASS_NAME, saddr, (unsigned)(saddr - pool));
+            if (!first)
+                first = saddr;
+            if (++found >= 10)
+            {
+                printf("[metadata] 同名过多，停止匹配\n");
+                return first;
+            }
+        }
+
+        /* 保存尾部用于跨块匹配 */
+        tail_len = pat_len - 1 < (size_t)got ? pat_len - 1 : (size_t)got;
+        memcpy(tail, buf + got - tail_len, tail_len);
+
+        if (found && (a - pool) > 0x100000) /* 找到后最多再确认 1MB */
+            break;
+    }
+
+    if (found)
+        printf("[metadata] 类名字符串匹配 %d 个，采用第一个\n", found);
+    return first;
+}
+
+/* 模块映射范围（klass 判定用）：按 start 排序，二分查找 */
+struct mod_range
+{
+    uint64_t start;
+    uint64_t end;
+};
+
+#define MAX_MOD_RANGES 1024
+
+static int collect_module_ranges(const struct proc_map *maps, int nr,
+                                 struct mod_range *ranges, int max)
+{
+    int n = 0;
+    for (int i = 0; i < nr && n < max; i++)
+    {
+        const char *p = maps[i].path;
+        if (!p[0])
+            continue;
+        if (!strstr(p, ".so") && !strstr(p, ".dll") && !strstr(p, ".oat"))
+            continue;
+
+        ranges[n].start = maps[i].start;
+        ranges[n].end = maps[i].end;
+        n++;
+    }
+
+    /* 按 start 排序 */
+    for (int i = 1; i < n; i++)
+    {
+        struct mod_range r = ranges[i];
+        int j = i - 1;
+        while (j >= 0 && ranges[j].start > r.start)
+        {
+            ranges[j + 1] = ranges[j];
+            j--;
+        }
+        ranges[j + 1] = r;
+    }
+    return n;
+}
+
+static bool addr_in_module_ranges(uint64_t addr, const struct mod_range *ranges, int n)
+{
+    int lo = 0, hi = n - 1;
+    while (lo <= hi)
+    {
+        int mid = (lo + hi) / 2;
+        if (addr < ranges[mid].start)
+            hi = mid - 1;
+        else if (addr >= ranges[mid].end)
+            lo = mid + 1;
+        else
             return true;
     }
     return false;
 }
 
-/* ========== 实例定位 ========== */
-
-/*
- * 指针扫描：在 rw 扫描区里找"对象头 klass 指向 GameCore/il2cpp 代码段"的指针，
- * 并验证 [p + 0x244] 读出合理 int32。命中打印候选。
- * 返回第一个候选地址，没有返回 0。
- */
-static uint64_t scan_for_instance(pid_t pid, struct ls_virtual_memory *mem,
-                                  const struct code_seg *segs, int nr_segs)
+/* 4. 扫描实例：p 指向对象，对象头 klass 在模块内，且 klass 附近有类名字符串指针 */
+static uint64_t scan_instance(pid_t pid, const struct proc_map *maps, int nr,
+                              const struct mod_range *ranges, int nr_ranges,
+                              uint64_t class_str_addr, uint64_t *out_klass)
 {
+    uint8_t chunk[0x1000];
     uint64_t found = 0;
     int candidates = 0;
 
-    printf("\n[scan] 扫描实例中（代码段 %d 个，扫描区 %d 个）...\n", nr_segs, mem->region_count);
+    printf("\n[scan] 扫描实例（类名验证地址 0x%016" PRIx64 "，模块范围 %d 个）...\n",
+           class_str_addr, nr_ranges);
 
-    for (int r = 0; r < mem->region_count; r++)
+    for (int i = 0; i < nr; i++)
     {
-        uint64_t start = mem->regions[r].start;
-        uint64_t end = mem->regions[r].end;
-        uint64_t region_size = end - start;
+        /* 只扫可写映射（对象/静态字段在可写内存；metadata/只读段跳过） */
+        if (!maps[i].writable)
+            continue;
 
-        /* 大区域限扫前 16MB，避免扫描时间过长 */
-        if (region_size > 16UL * 1024 * 1024)
-            end = start + 16UL * 1024 * 1024;
+        uint64_t start = maps[i].start;
+        uint64_t end = maps[i].end;
+        uint64_t size = end - start;
+
+        /* 大映射限扫前 32MB */
+        if (size > 32UL * 1024 * 1024)
+            end = start + 32UL * 1024 * 1024;
 
         for (uint64_t a = start; a + 8 <= end; a += 0x1000)
         {
-            uint64_t chunk[0x1000 / 8];
             int got = ls_read(pid, a, chunk, sizeof(chunk));
             if (got <= 0)
                 continue;
 
-            for (size_t i = 0; i < sizeof(chunk) / 8; i++)
+            for (int o = 0; o + 8 <= got; o += 8)
             {
-                uint64_t p = chunk[i];
-                if (p < 0x1000 || (p >> 48) != 0)
+                uint64_t p;
+                memcpy(&p, chunk + o, 8);
+                if (p < 0x10000 || (p >> 48) != 0)
                     continue; /* 只扫用户态指针 */
 
-                /* 对象头 klass 指向代码段 */
-                if (!addr_in_code_segs(p, segs, nr_segs))
+                /* 对象头 klass：读 [p]，必须是模块内地址 */
+                uint64_t klass = 0;
+                if (ls_read(pid, p, &klass, 8) <= 0)
+                    continue;
+                if (!addr_in_module_ranges(klass, ranges, nr_ranges))
                     continue;
 
-                /* 验证字段值 */
-                int32_t v = 0;
-                if (ls_read(pid, p + FIELD_OFFSET, &v, sizeof(v)) <= 0)
+                /* 验证：klass 结构（Il2CppClass）附近存在指向类名字符串的指针 */
+                uint8_t kbuf[0x1000];
+                uint64_t kpage = klass & ~0xFFFULL;
+                if (ls_read(pid, kpage, kbuf, sizeof(kbuf)) <= 0)
                     continue;
 
-                if (v >= PUNISH_VALUE_MIN && v <= PUNISH_VALUE_MAX)
+                bool match = false;
+                for (int ko = 0; ko + 8 <= (int)sizeof(kbuf); ko += 8)
                 {
-                    uint64_t obj_addr = a + i * 8;
-                    printf("[candidate] obj=0x%016" PRIx64 "  klass=0x%016" PRIx64
-                           "  punish=%d (0x%x)\n",
-                           obj_addr, p, v, (unsigned)v);
-                    candidates++;
-                    if (!found)
-                        found = obj_addr;
-                    if (candidates >= 20)
+                    uint64_t v;
+                    memcpy(&v, kbuf + ko, 8);
+                    if (v == class_str_addr)
                     {
-                        printf("[scan] 候选过多，停止扫描\n");
-                        return found;
+                        match = true;
+                        break;
                     }
+                }
+                if (!match)
+                    continue;
+
+                uint64_t obj = p;
+                printf("[candidate] 实例=0x%016" PRIx64 "  klass=0x%016" PRIx64
+                       "  引用槽位=0x%016" PRIx64 "\n",
+                       obj, klass, a + (uint64_t)o);
+                candidates++;
+                if (!found)
+                {
+                    found = obj;
+                    if (out_klass)
+                        *out_klass = klass;
+                }
+                if (candidates >= 10)
+                {
+                    printf("[scan] 候选过多，停止扫描\n");
+                    return found;
                 }
             }
 
@@ -198,6 +431,50 @@ static uint64_t scan_for_instance(pid_t pid, struct ls_virtual_memory *mem,
 
     printf("[scan] 扫描完成，候选 %d 个\n", candidates);
     return found;
+}
+
+/*
+ * 自动定位 CSkillButtonManager 实例（零参数）。
+ * 返回实例地址；失败返回 0。
+ */
+static uint64_t auto_locate_instance(pid_t pid)
+{
+    struct proc_map maps[MAX_MAPS];
+    int nr = parse_proc_maps(pid, maps, MAX_MAPS);
+    if (nr <= 0)
+    {
+        printf("[error] 解析 /proc/%d/maps 失败\n", pid);
+        return 0;
+    }
+
+    /* 1. metadata */
+    int md_version = 0;
+    uint64_t md = locate_metadata(pid, maps, nr, &md_version);
+    if (!md)
+    {
+        printf("[error] 未找到 global-metadata.dat（sanity 0x%x），请用 -a 指定实例地址\n",
+               MD_SANITY);
+        return 0;
+    }
+
+    /* 2. 类名字符串 */
+    uint64_t class_str = locate_class_string(pid, md, NULL);
+    if (!class_str)
+    {
+        printf("[error] 字符串池中未找到类名 \"%s\"\n", CLASS_NAME);
+        return 0;
+    }
+
+    /* 3. 模块范围 + 实例扫描 */
+    struct mod_range ranges[MAX_MOD_RANGES];
+    int nr_ranges = collect_module_ranges(maps, nr, ranges, MAX_MOD_RANGES);
+    if (nr_ranges <= 0)
+    {
+        printf("[error] 未找到任何模块映射\n");
+        return 0;
+    }
+
+    return scan_instance(pid, maps, nr, ranges, nr_ranges, class_str, NULL);
 }
 
 /* ========== 字段读写 ========== */
@@ -519,17 +796,17 @@ int main(int argc, char *argv[])
         return 0;
     }
 
-    /* 4. 定位实例 */
+    /* 4. 定位实例：-a 指定，否则 IL2CPP 元数据自动定位（零参数） */
     if (!instance)
     {
-        instance = scan_for_instance(pid, mem, segs, nr_segs);
+        instance = auto_locate_instance(pid);
         if (!instance)
         {
-            printf("[error] 未找到实例，请用 -a <addr> 直接指定（可用 --watch 前的候选打印或反编译工具定位）\n");
+            printf("[error] 自动定位失败，请用 -a <addr> 直接指定实例地址\n");
             free(mem);
             return 1;
         }
-        printf("[scan] 采用候选: 0x%016" PRIx64 "\n", instance);
+        printf("[scan] 采用实例: 0x%016" PRIx64 "\n", instance);
     }
 
     /* 5. 修改字段（可选） */
