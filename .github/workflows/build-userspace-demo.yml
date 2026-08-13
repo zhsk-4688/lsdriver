@@ -1,0 +1,36 @@
+# 用户态工具（lsdriver.h / demo / wxshadow_client）交叉编译校验
+name: build-userspace-demo
+
+on:
+  push:
+    paths:
+      - 'android/**'
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 安装 aarch64 交叉编译器
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: 编译 demo 与客户端
+        run: |
+          make -C android CROSS=aarch64-linux-gnu-
+          ls -lh android/demo_punish_damage android/wxshadow_client/wxshadow_client
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: userspace-tools
+          path: |
+            android/demo_punish_damage
+            android/wxshadow_client/wxshadow_client
+          if-no-files-found: error

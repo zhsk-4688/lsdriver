@@ -738,6 +738,37 @@ dmesg | grep wxshadow
   hook（wxshadow 的 work_fn 同时清理两套影子页），故障处理各自走
   `do_page_fault` / `do_mem_abort`，互不干扰
 
+### 12.6 demo：王者荣耀 PunishDamage 字段 hook
+
+`android/lsdriver.h` + `android/demo_punish_damage.c` 提供完整示例：
+hook `com.tencent.tmgp.sgame`（王者荣耀）`CSkillButtonManager` 类的
+`<PunishDamage>k__BackingField`（偏移 `0x244`，int32）：
+
+```bash
+# 交叉编译（demo + wxshadow_client）
+make -C android CROSS=aarch64-linux-gnu-
+
+# 1) 自动扫描定位 CSkillButtonManager 实例并打印字段值
+./demo_punish_damage
+
+# 2) 直接指定实例地址
+./demo_punish_damage -a 0x7b5c001000
+
+# 3) 修改字段
+./demo_punish_damage -a 0x7b5c001000 -w 999
+
+# 4) 硬件写观察点监控字段被写入（命中 PC 即"写字段的指令地址"）
+./demo_punish_damage -a 0x7b5c001000 --watch
+
+# 5) wxshadow 无痕断点：把第 4 步得到的 PC（或反编译工具里写 0x244 的指令地址）
+#    交给 -b 下无痕断点，-r 修改命中寄存器，demo 轮询打印字段值变化
+./demo_punish_damage -a 0x7b5c001000 -b 0x6f123456 -r x1=999
+```
+
+无痕断点模式会演示"无痕"效果：下断点前后读取同一代码地址的指令字节，
+结果完全一致（BRK 只存在于影子页，读取路径永远看到原始指令）；
+命中现场（PC/寄存器）打印到内核日志：`dmesg | grep wxshadow`。
+
 ---
 
 ## 13. 编译说明
