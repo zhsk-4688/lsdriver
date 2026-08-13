@@ -342,8 +342,21 @@ static inline int ls_io_commit(void)
 
     g_req->kernel = true;
     asm volatile("dmb ish" ::: "memory");
+
+    /*
+     * 先忙等（驱动处理完直接写共享内存 user 标志，忙等可微秒级感知），
+     * 超过约 3000 次 yield 再 usleep 短睡兜底，避免长时间空转。
+     * 相比固定 usleep(100)，单次往返延迟从 ~150-200us 降到 ~20-60us。
+     */
+    int spins = 0;
     while (!g_req->user)
-        usleep(100);
+    {
+        if (++spins <= 3000)
+            asm volatile("yield" ::: "memory");
+        else
+            usleep(20);
+    }
+
     asm volatile("dmb ish" ::: "memory");
     g_req->user = false;
     return g_req->status;
