@@ -379,22 +379,60 @@ static uint64_t scan_instance(pid_t pid, const struct proc_map *maps, int nr,
     uint64_t found = 0;
     int candidates = 0;
 
-    printf("\n[scan] 扫描实例（类名验证地址 0x%016" PRIx64 "，模块范围 %d 个）...\n",
-           class_str_addr, nr_ranges);
-
-    for (int i = 0; i < nr; i++)
+    /* 收集可写映射并按"优先级 + 大小升序"排序：
+     * 模块 data 段（static_fields 单例引用所在）优先，其次小堆，大堆最后 */
+    struct scan_map
     {
-        /* 只扫可写映射（对象/静态字段在可写内存；metadata/只读段跳过） */
+        uint64_t start;
+        uint64_t end;
+        int priority;
+    } sm[MAX_MAPS];
+    int n = 0;
+
+    for (int i = 0; i < nr && n < MAX_MAPS; i++)
+    {
         if (!maps[i].writable)
             continue;
 
-        uint64_t start = maps[i].start;
-        uint64_t end = maps[i].end;
+        sm[n].start = maps[i].start;
+        sm[n].end = maps[i].end;
+        sm[n].priority = (maps[i].path[0] && strstr(maps[i].path, ".so")) ? 0 : 1;
+        n++;
+    }
+
+    for (int i = 1; i < n; i++)
+    {
+        struct scan_map m = sm[i];
+        int j = i - 1;
+        while (j >= 0 &&
+               (sm[j].priority > m.priority ||
+                (sm[j].priority == m.priority &&
+                 (sm[j].end - sm[j].start) > (m.end - m.start))))
+        {
+            sm[j + 1] = sm[j];
+            j--;
+        }
+        sm[j + 1] = m;
+    }
+
+    printf("\n[scan] 扫描实例（类名验证地址 0x%016" PRIx64
+           "，可写映射 %d 个，模块范围 %d 个）...\n",
+           class_str_addr, n, nr_ranges);
+
+    uint64_t budget = 256UL * 1024 * 1024; /* 总扫描预算 */
+    uint64_t scanned = 0;
+
+    for (int i = 0; i < n && budget > 0; i++)
+    {
+        uint64_t start = sm[i].start;
+        uint64_t end = sm[i].end;
         uint64_t size = end - start;
 
-        /* 大映射限扫前 32MB */
-        if (size > 32UL * 1024 * 1024)
-            end = start + 32UL * 1024 * 1024;
+        /* 每映射限扫 16MB；预算不足时截断 */
+        if (size > 16UL * 1024 * 1024)
+            end = start + 16UL * 1024 * 1024;
+        if ((end - start) > budget)
+            end = start + budget;
 
         for (uint64_t a = start; a + 8 <= end; a += 0x1000)
         {
@@ -460,12 +498,19 @@ static uint64_t scan_instance(pid_t pid, const struct proc_map *maps, int nr,
                 }
             }
 
+            scanned += 0x1000;
+            budget -= 0x1000;
+            if ((scanned & 0x3FFFFFF) == 0) /* 每 64MB 打印进度 */
+                printf("[scan] 已扫描 %llu MB / 预算 256 MB...\n",
+                       (unsigned long long)(scanned >> 20));
+
             if (g_stop)
                 return found;
         }
     }
 
-    printf("[scan] 扫描完成，候选 %d 个\n", candidates);
+    printf("[scan] 扫描完成（%llu MB），候选 %d 个\n",
+           (unsigned long long)(scanned >> 20), candidates);
     return found;
 }
 
