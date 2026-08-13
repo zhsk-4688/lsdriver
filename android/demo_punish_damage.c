@@ -21,10 +21,9 @@
  * Ctrl+C 退出并自动删除无痕断点。
  *
  * 编译：make -C android CROSS=aarch64-linux-gnu-
+ *       （DroidC 等编译器亦可，代码兼容 C/C++ 编译）
  * 运行：./demo_punish_damage     （root，lsdriver 已加载，游戏已进对局）
  */
-
-#define _GNU_SOURCE
 
 #include <inttypes.h>
 #include <signal.h>

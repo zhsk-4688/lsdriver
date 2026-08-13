@@ -478,7 +478,8 @@ static inline int ls_get_memory_info(pid_t pid, struct ls_virtual_memory *mem)
  */
 static inline uint64_t ls_get_module_address(pid_t pid, const char *name_suffix)
 {
-    struct ls_virtual_memory *mem = malloc(sizeof(*mem));
+    /* DroidC 等 C++ 模式编译需要显式强转 void* */
+    struct ls_virtual_memory *mem = (struct ls_virtual_memory *)malloc(sizeof(*mem));
     if (!mem)
         return 0;
 
