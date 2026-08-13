@@ -455,16 +455,13 @@ static int ls_shadow_mem_abort_hook_work(struct pt_regs *hook_regs)
     return status ? 0 : 1;
 }
 
-static int ls_shadow_exit_mmap_hook_work(struct pt_regs *hook_regs)
-{
-    if (!hook_regs) return 0;
-    ls_shadow_release_mm((struct mm_struct *)hook_regs->regs[0]);
-    return 0;
-}
-
+/*
+ * 注意：exit_mmap 不再由本文件 hook —— wxshadow_hook.h 的 exit_mmap work_fn
+ * 会同时调用 ls_shadow_release_mm() 清理本文件的影子页，避免同目标双 hook
+ * （inline hook 框架不支持同函数叠加安装）。
+ */
 static struct hook_entry ls_shadow_hooks[] = {
     HOOK_ENTRY("do_mem_abort", ls_shadow_mem_abort_hook_work),
-    HOOK_ENTRY("exit_mmap", ls_shadow_exit_mmap_hook_work),
 };
 
 static int ls_shadow_init(void)

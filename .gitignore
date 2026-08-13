@@ -10,6 +10,9 @@
 *.lds
 *.usyms
 
+# 打包生成的自解压安装脚本（由 packer.sh 生成）
+install_driver.sh
+
 # 忽略 VS Code 配置
 .vscode/
 .claude/

@@ -30,7 +30,6 @@
 #include <linux/sort.h>
 #include "export_fun.h"
 #include "io_struct.h"
-#include "shadow_memory.h"
 
 //============方案1:PTE读写+MMU硬件翻译地址(翻译和读写可以混搭)============
 
@@ -482,11 +481,11 @@ static inline int walk_translate_va_to_pa(struct mm_struct *mm, uint64_t vaddr, 
 // 进程读写
 static inline int virtual_memory_rw(enum request_op op, pid_t pid, uint64_t vaddr, void *buffer, size_t size)
 {
+    static pid_t s_last_pid = 0;
+    static struct mm_struct *s_last_mm = NULL;
     static uint64_t s_last_vpage_base = -1ULL;
     static phys_addr_t s_last_ppage_base = 0;
 
-    struct mm_struct *mm = NULL;
-    struct vm_area_struct *vma = NULL;
     phys_addr_t paddr_of_page = 0;
     uint64_t current_vaddr = untagged_addr(vaddr);
     size_t bytes_remaining = size;
@@ -496,10 +495,25 @@ static inline int virtual_memory_rw(enum request_op op, pid_t pid, uint64_t vadd
 
     if (!buffer || size == 0) return -EINVAL;
 
-    mm = get_mm_by_pid(pid);
-    if (!mm) return -EINVAL;
+    /* ---------- mm_struct 缓存 ---------- */
+    if (pid != s_last_pid || s_last_mm == NULL)
+    {
+        // 目标进程切换清缓存
+        s_last_mm = 0;
+        s_last_mm = get_mm_by_pid(pid); // 引用计数+1
+        // 这里不长期持有mm引用计数,靠后面的判断稳住mm释放时也不崩溃
+        if (s_last_mm)
+        {
+            mmput(s_last_mm); // 引用计数-1
+        }
+        else
+        {
+            return -EINVAL;
+        }
 
-    s_last_vpage_base = -1ULL;
+        s_last_pid = pid;
+        s_last_vpage_base = -1ULL;
+    }
 
     /* ---------- 逐页循环 ---------- */
     while (bytes_remaining > 0)
@@ -529,7 +543,7 @@ static inline int virtual_memory_rw(enum request_op op, pid_t pid, uint64_t vadd
             物理地址指向了高通联发科芯片中受保护的区域（例如 TrustZone 运行的物理 SRAM/DRAM 区域、敏感数据区）
             抛出最高优先级的 Synchronous External Abort，
             */
-            uint64_t task_size = READ_ONCE(mm->task_size);
+            uint64_t task_size = READ_ONCE(s_last_mm->task_size);
             if (current_vaddr >= task_size || bytes_this_page > task_size - current_vaddr)
             {
                 status = -EFAULT;
@@ -538,46 +552,9 @@ static inline int virtual_memory_rw(enum request_op op, pid_t pid, uint64_t vadd
                 goto next_chunk;
             }
 
-            mmap_read_lock(mm);
-            vma = find_vma(mm, current_vaddr);
-            if (!vma || current_vaddr < vma->vm_start)
-            {
-                mmap_read_unlock(mm);
-                status = -EFAULT;
-                s_last_vpage_base = -1ULL;
-                if (op == request_op_vmem_read && size > 8) __builtin_memset((uint8_t *)buffer + bytes_copied, 0, bytes_this_page);
-                goto next_chunk;
-            }
-
-            if (op == request_op_vmem_read)
-            {
-                status = ls_shadow_read_original(mm, current_vaddr, (uint8_t *)buffer + bytes_copied, bytes_this_page);
-                if (status > 0)
-                {
-                    mmap_read_unlock(mm);
-                    bytes_done += bytes_this_page;
-                    status = 0;
-                    goto next_chunk;
-                }
-            }
-
-            if (op == request_op_vmem_write && (vma->vm_flags & VM_EXEC))
-            {
-                status = ls_shadow_write_exec(mm, vma, current_vaddr, (const uint8_t *)buffer + bytes_copied, bytes_this_page);
-                mmap_read_unlock(mm);
-                if (status == 0)
-                {
-                    bytes_done += bytes_this_page;
-                    goto next_chunk;
-                }
-                s_last_vpage_base = -1ULL;
-                goto next_chunk;
-            }
-
             // 翻译地址
-            status = mmu_translate_va_to_pa(mm, current_vpn, &paddr_of_page);
-            // status = walk_translate_va_to_pa(mm, current_vpn, &paddr_of_page);
-            mmap_read_unlock(mm);
+            status = mmu_translate_va_to_pa(s_last_mm, current_vpn, &paddr_of_page);
+            // status = walk_translate_va_to_pa(s_last_mm, current_vpn, &paddr_of_page);
 
             if (status != 0)
             {
@@ -618,7 +595,6 @@ static inline int virtual_memory_rw(enum request_op op, pid_t pid, uint64_t vadd
         current_vaddr += bytes_this_page;
     }
 
-    mmput(mm);
     return (bytes_done == 0) ? status : (int)bytes_done;
 }
 

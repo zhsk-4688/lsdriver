@@ -53,7 +53,8 @@ saved_insn[] 继续保留目标入口的 BRK 现场，供卸载 inline hook 时�
 
 #define TRAMP_WORDS             120
 #define TRAMP_BYTES             (TRAMP_WORDS * 4)
-#define TRAMP_SLOT_COUNT        32
+// wxshadow 无痕hook 加入后需要更多槽位（异常链路 6 个 + prctl 1 个）
+#define TRAMP_SLOT_COUNT        48
 #define TRAMP_REPLAY_INSN_INDEX 57
 #define TRAMP_RET_TO_ORIG_INDEX 61
 #define TRAMP_RET_SLOT_INDEX    116

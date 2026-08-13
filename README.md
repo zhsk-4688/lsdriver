@@ -1,4 +1,4 @@
-# 内存调试分析驱动
+﻿# 内存调试分析驱动
 
 > 仅供技术研究与学习，严禁用于非法用途。作者不承担任何违法责任。
 
@@ -650,9 +650,99 @@ inline hook 表：
 
 ---
 
-## 12. 编译说明
+## 12. W^X Shadow Memory 无痕 hook（移植自 wxshadow）
 
-### 12.1 直接编译模块
+> 由 KernelPatch KPM 模块（mkpms/kpms/wxshadow）移植适配到 lsdriver LKM，
+> 源码在 `lsdriver/wxshadow_hook.h`。接口与 wxshadow 完全一致，客户端零改动。
+
+### 12.1 原理
+
+在目标进程代码页上创建"影子页"：影子页里写入 BRK 断点（或自定义 patch），
+进程**读取**时映射到原始页（`r--`），**执行**时映射到影子页（`--x`）。
+因此内存完整性校验读到的永远是原始代码，hook 修改不留在被监控页上。
+
+```
+NONE -> SHADOW_X(--x) <-> ORIGINAL(r--) <-> STEPPING(r-x)
+                    \-> DORMANT (hook 退休，保留影子页)
+```
+
+BRK 命中流程：BRK 触发 -> 切到原始页 `r-x` 单步执行原始指令 ->
+单步异常 -> 切回影子页，命中现场可读写寄存器。
+
+### 12.2 prctl 接口（与 wxshadow 相同）
+
+| 命令 | 值 | 说明 |
+|------|------|------|
+| `PR_WXSHADOW_SET_BP` | `0x57580001` | 设置隐藏断点（pid, addr） |
+| `PR_WXSHADOW_SET_REG` | `0x57580002` | 配置断点命中时的寄存器修改（pid, addr, reg, value） |
+| `PR_WXSHADOW_DEL_BP` | `0x57580003` | 删除断点（pid, addr；addr=0 全部删除） |
+| `PR_WXSHADOW_SET_TLB_MODE` | `0x57580004` | 设置 TLB flush 模式 |
+| `PR_WXSHADOW_GET_TLB_MODE` | `0x57580005` | 获取 TLB flush 模式 |
+| `PR_WXSHADOW_PATCH` | `0x57580006` | 自定义 patch 写入影子页（pid, addr, buf, len） |
+| `PR_WXSHADOW_RELEASE` | `0x57580008` | 释放 shadow 恢复原始页（pid, addr；addr=0 全部释放） |
+
+### 12.3 客户端使用
+
+```bash
+# 交叉编译
+cd android/wxshadow_client && make CROSS=aarch64-linux-gnu-
+
+# 查看目标进程可执行区域
+./wxshadow_client -p <pid> -m
+
+# 设置断点（按地址 / 按库名+偏移）
+./wxshadow_client -p <pid> -a 0x7b5c001234
+./wxshadow_client -p <pid> -b libc.so -o 0x12345
+
+# 断点 + 修改寄存器
+./wxshadow_client -p <pid> -a 0x7b5c001234 -r x0=0 -r x1=0x100
+
+# 删除断点 / 删除全部
+./wxshadow_client -p <pid> -a 0x7b5c001234 -d
+./wxshadow_client -p <pid> -d
+
+# 自定义 patch（NOP）
+./wxshadow_client -p <pid> -a 0x7b5c001234 --patch d503201f
+
+# 释放指定 / 全部 shadow
+./wxshadow_client -p <pid> -a 0x7b5c001234 --release
+./wxshadow_client -p <pid> --release
+
+# 内核日志
+dmesg | grep wxshadow
+```
+
+### 12.4 内核侧 hook 点（inline hook 框架）
+
+| 目标符号 | 作用 |
+|---------|------|
+| `brk_handler` | BRK #7 命中 -> 单步 |
+| `single_step_handler` | 单步完成 -> 切回影子页 |
+| `do_page_fault` | 读故障 -> 原页 `r--`；取指故障 -> 影子页 `--x` |
+| `exit_mmap` | 进程退出清理影子页 |
+| `follow_page_pte` | GUP 隐藏（`/proc/pid/mem`、`process_vm_readv`、ptrace） |
+| `dup_mmap` | fork 保护（子进程不继承影子页） |
+| `__arm64_sys_prctl` / `__se_sys_prctl` | prctl 接口 |
+
+### 12.5 限制
+
+- 仅支持 ARM64（4K 页）
+- PATCH 不能跨页（offset + len <= PAGE_SIZE）
+- 每页最多 128 个断点 / 128 个 patch；每个断点最多 4 个寄存器修改
+- 与 KernelPatch 版 wxshadow 的行为差异：
+  - `follow_page_pte`（GUP 隐藏）采用 before-only 变体：切原页 + 广播刷 TLB，
+    目标进程下次取指时自动切回影子页（每次 GUP 读取后多一次取指故障）
+  - fork 保护暂停父进程影子映射，恢复由取指故障路径完成
+  - TLB 刷新统一走 lsdriver 广播原语（`flush_tlb_addr_all_asid_all_cpus`）
+- 与 `shadow_memory.h`（影子页 patch 隐藏）共存：两个系统共用 `exit_mmap`
+  hook（wxshadow 的 work_fn 同时清理两套影子页），故障处理各自走
+  `do_page_fault` / `do_mem_abort`，互不干扰
+
+---
+
+## 13. 编译说明
+
+### 13.1 直接编译模块
 
 在目标内核源码树执行：
 
@@ -660,7 +750,7 @@ inline hook 表：
 make -C <KDIR> M=$PWD/lsdriver ARCH=arm64 LLVM=1 modules
 ```
 
-### 12.2 Makefile 当前参数
+### 13.2 Makefile 当前参数
 
 `lsdriver/Makefile` 当前默认启用：
 
