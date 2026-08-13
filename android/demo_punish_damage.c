@@ -56,10 +56,13 @@ static void on_signal(int sig)
 
 /*
  * 定位流程：
- *   1. 扫描进程可读映射找 global-metadata.dat 特征（sanity 0xFAB11BAF）
- *   2. 读 metadata 头的 stringOffset/stringCount（偏移 0x18/0x1C，IL2CPP 24~32 稳定）
- *   3. 在字符串池内存中模式匹配类名 "CSkillButtonManager" -> 类名字符串精确地址
- *   4. 扫描进程可写映射：指针 p 指向的对象，其对象头 klass 落在模块映射内，
+ *   1. （快速路径）扫描进程可读映射找 global-metadata.dat 特征
+ *      （sanity 0xFAB11BAF；部分游戏头部加密时失败，走 2）
+ *   2. （主路径）全内存直接搜索类名字符串 "CSkillButtonManager"
+ *      王者荣耀等游戏的 metadata 头部已加密（sanity 不可用），但字符串池
+ *      内容仍是明文（GameGuardian 搜 "get_fieldOfView" 特征串即可验证），
+ *      因此直接搜类名最可靠，不依赖 metadata 头部结构
+ *   3. 扫描进程可写映射：指针 p 指向的对象，其对象头 klass 落在模块映射内，
  *      且 klass 结构附近（±0x200）存在指向类名字符串的指针（Il2CppClass.name）
  *      -> p 就是 CSkillButtonManager 实例
  */
@@ -217,6 +220,97 @@ static uint64_t locate_class_string(pid_t pid, uint64_t metadata_base)
     return first;
 }
 
+/*
+ * 2b. 全内存直接搜索类名（metadata 头部加密时的主路径）。
+ * 按映射大小降序扫描可读映射（字符串池所在映射巨大，排前优先命中），
+ * 预算 256MB，每映射限扫 64MB。
+ */
+static uint64_t locate_class_string_anywhere(pid_t pid, const struct proc_map *maps, int nr)
+{
+    static const char pattern[] = CLASS_NAME;
+    size_t pat_len = sizeof(pattern) - 1;
+
+    struct big_map
+    {
+        uint64_t start;
+        uint64_t end;
+    } big[MAX_MAPS];
+    int n = 0;
+
+    for (int i = 0; i < nr && n < MAX_MAPS; i++)
+    {
+        if (!maps[i].readable)
+            continue;
+        if (maps[i].end - maps[i].start < 0x100000)
+            continue; /* 字符串池在巨型映射里，跳过 < 1MB */
+
+        big[n].start = maps[i].start;
+        big[n].end = maps[i].end;
+        n++;
+    }
+
+    /* 按大小降序 */
+    for (int i = 1; i < n; i++)
+    {
+        struct big_map m = big[i];
+        int j = i - 1;
+        while (j >= 0 && (big[j].end - big[j].start) < (m.end - m.start))
+        {
+            big[j + 1] = big[j];
+            j--;
+        }
+        big[j + 1] = m;
+    }
+
+    printf("[scan] metadata 头部加密，全内存搜索类名（映射 %d 个，按大小降序）...\n", n);
+
+    uint8_t buf[0x1000];
+    uint8_t tail[32];
+    size_t tail_len = 0;
+    uint64_t budget = 256UL * 1024 * 1024;
+
+    for (int i = 0; i < n && budget > 0; i++)
+    {
+        uint64_t start = big[i].start;
+        uint64_t end = big[i].end;
+        if (end - start > 64UL * 1024 * 1024)
+            end = start + 64UL * 1024 * 1024; /* 每映射限扫 64MB */
+
+        for (uint64_t a = start; a < end; a += 0x1000)
+        {
+            int got = ls_read(pid, a, buf, sizeof(buf));
+            if (got <= 0)
+                continue;
+
+            uint8_t combined[0x1000 + 32];
+            size_t logical_len = (size_t)got + tail_len;
+            uint64_t logical_base = a - tail_len;
+
+            memcpy(combined, tail, tail_len);
+            memcpy(combined + tail_len, buf, (size_t)got);
+
+            for (size_t o = 0; o + pat_len <= logical_len; o++)
+            {
+                if (memcmp(combined + o, pattern, pat_len) != 0)
+                    continue;
+
+                uint64_t saddr = logical_base + (uint64_t)o;
+                printf("[scan] 类名 \"%s\" @ 0x%016" PRIx64 "\n", CLASS_NAME, saddr);
+                return saddr;
+            }
+
+            tail_len = pat_len - 1 < (size_t)got ? pat_len - 1 : (size_t)got;
+            memcpy(tail, buf + got - tail_len, tail_len);
+
+            budget -= 0x1000;
+            if (budget == 0)
+                break;
+        }
+    }
+
+    return 0;
+}
+
 /* 模块映射范围（klass 判定用）：按 start 排序，二分查找 */
 struct mod_range
 {
@@ -372,18 +466,19 @@ static uint64_t auto_locate_instance(pid_t pid)
         return 0;
     }
 
+    /* 1. metadata：sanity 快速路径（头部未加密的游戏） */
     int md_version = 0;
     uint64_t md = locate_metadata(pid, maps, nr, &md_version);
-    if (!md)
-    {
-        printf("[error] 未找到 global-metadata.dat（sanity 0x%x）\n", MD_SANITY);
-        return 0;
-    }
 
-    uint64_t class_str = locate_class_string(pid, md);
+    /* 2. 类名字符串：优先字符串池内搜索，加密时全内存搜索 */
+    uint64_t class_str = 0;
+    if (md)
+        class_str = locate_class_string(pid, md);
+    if (!class_str)
+        class_str = locate_class_string_anywhere(pid, maps, nr);
     if (!class_str)
     {
-        printf("[error] 字符串池中未找到类名 \"%s\"\n", CLASS_NAME);
+        printf("[error] 未找到类名 \"%s\"\n", CLASS_NAME);
         return 0;
     }
 
